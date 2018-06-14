@@ -1,22 +1,27 @@
 #!/usr/bin/env python
 import os
-from flask import Flask, abort, request, jsonify, g, url_for
+from flask import Flask, abort, request, jsonify, g, url_for, redirect, send_from_directory
+from werkzeug.utils import secure_filename
 from flask_sqlalchemy import SQLAlchemy
-from flask_httpauth import HTTPBasicAuth
+from flask_httpauth import HTTPBasicAuth, HTTPTokenAuth
 from passlib.apps import custom_app_context as pwd_context
-from itsdangerous import (TimedJSONWebSignatureSerializer
-                          as Serializer, BadSignature, SignatureExpired)
+from itsdangerous import (TimedJSONWebSignatureSerializer as Serializer, BadSignature, SignatureExpired)
+
+ALLOWED_EXTENSIONS = set(['txt', 'pdf', 'png', 'jpg', 'jpeg', 'gif'])
 
 # initialization
 app = Flask(__name__)
 app.config['SECRET_KEY'] = 'the quick brown fox jumps over the lazy dog'
 app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///db.sqlite'
 app.config['SQLALCHEMY_COMMIT_ON_TEARDOWN'] = True
+app.config['UPLOAD_DIR'] = '/tmp/uploads/'
+app.config['MAX_CONTENT_LENGTH'] = 2 * 1024 * 1024
 
 # extensions
 db = SQLAlchemy(app)
-auth = HTTPBasicAuth()
-
+basic_auth = HTTPBasicAuth()
+token_auth = HTTPTokenAuth('Token')
+uploaded_files = {}
 
 class User(db.Model):
     __tablename__ = 'users'
@@ -47,15 +52,19 @@ class User(db.Model):
         return user
 
 
-@auth.verify_password
-def verify_password(username_or_token, password):
-    # first try to authenticate by token
-    user = User.verify_auth_token(username_or_token)
+@token_auth.verify_token
+def verify_token(token):
+    user = User.verify_auth_token(token)
     if not user:
-        # try to authenticate with username/password
-        user = User.query.filter_by(username=username_or_token).first()
-        if not user or not user.verify_password(password):
-            return False
+        return False
+    g.user = user
+    return True
+
+@basic_auth.verify_password
+def verify_pwd(username, password):
+    user = User.query.filter_by(username=username).first()
+    if not user or not user.verify_password(password):
+        return False
     g.user = user
     return True
 
@@ -72,8 +81,7 @@ def new_user():
     user.hash_password(password)
     db.session.add(user)
     db.session.commit()
-    return (jsonify({'username': user.username}), 201,
-            {'Location': url_for('get_user', id=user.id, _external=True)})
+    return (jsonify({'username': user.username}), 201, {'Location': url_for('get_user', id=user.id, _external=True)})
 
 
 @app.route('/api/users/<int:id>')
@@ -85,19 +93,51 @@ def get_user(id):
 
 
 @app.route('/api/token')
-@auth.login_required
+@basic_auth.login_required
 def get_auth_token():
     token = g.user.generate_auth_token(600)
     return jsonify({'token': token.decode('ascii'), 'duration': 600})
 
 
 @app.route('/api/resource')
-@auth.login_required
+@token_auth.login_required
 def get_resource():
     return jsonify({'data': 'Hello, %s!' % g.user.username})
 
+def allowed_file(filename):
+    return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
+
+@app.route('/', methods=['GET', 'POST'])
+@token_auth.login_required
+def upload_file():
+    if request.method == 'POST':
+        if 'file' not in request.files:
+            return 'No file specified'
+        file = request.files['file']
+        if file.filename == '':
+            return 'Empty filename'
+        if file and allowed_file(file.filename):
+            filename = secure_filename(file.filename)
+            file.save(os.path.join(app.config['UPLOAD_DIR'], filename))
+            uploaded_files[filename] = g.user.username
+            return "Successfully uploaded file"
+    return redirect(request.url)
+
+def return_error(message):
+    return message
+
+@app.route('/uploads/<filename>')
+@token_auth.login_required
+def download_file(filename):
+    filename = secure_filename(filename)
+    if os.path.isfile(os.path.join(app.config['UPLOAD_DIR'], filename)):
+        if uploaded_files.get(filename) == g.user.username:
+            return send_from_directory(app.config['UPLOAD_DIR'], filename)
+        else: return "Failed to download {}: Unauthorized Access".format(filename) 
+    else: return "Failed to download {}: File does not exist".format(filename)
+    
 
 if __name__ == '__main__':
-    if not os.path.exists('db.sqlite'):
-        db.create_all()
+    db.drop_all()
+    db.create_all()
     app.run(debug=True)
